@@ -20,6 +20,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/version"
 	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
+	k8srequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/util/openapi"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/grafana/grafana/pkg/apiserver/endpoints/filters"
 	grafanarest "github.com/grafana/grafana/pkg/apiserver/rest"
+	"github.com/grafana/grafana/pkg/services/apiserver/endpoints/request"
 	"github.com/grafana/grafana/pkg/services/apiserver/options"
 )
 
@@ -145,6 +147,15 @@ type ServerLockService interface {
 	LockExecuteAndRelease(ctx context.Context, actionName string, maxInterval time.Duration, fn func(ctx context.Context)) error
 }
 
+func getRequestInfo(gr schema.GroupResource, namespaceMapper request.NamespaceMapper) *k8srequest.RequestInfo {
+	return &k8srequest.RequestInfo{
+		APIGroup:  gr.Group,
+		Resource:  gr.Resource,
+		Name:      "",
+		Namespace: namespaceMapper(int64(1)),
+	}
+}
+
 func InstallAPIs(
 	scheme *runtime.Scheme,
 	codecs serializer.CodecFactory,
@@ -153,6 +164,7 @@ func InstallAPIs(
 	builders []APIGroupBuilder,
 	storageOpts *options.StorageOptions,
 	reg prometheus.Registerer,
+	namespaceMapper request.NamespaceMapper,
 	kvStore grafanarest.NamespacedKVStore,
 	serverLock ServerLockService,
 ) error {
@@ -168,9 +180,12 @@ func InstallAPIs(
 			// when missing this will default to mode zero (legacy only)
 			mode := storageOpts.DualWriterDesiredModes[key]
 
+			// TODO: inherited context from main Grafana process
+			ctx := context.Background()
+
 			// Moving from one version to the next can only happen after the previous step has
 			// successfully synchronized.
-			currentMode, err := grafanarest.SetDualWritingMode(context.Background(), kvStore, legacy, storage, key, mode, reg)
+			currentMode, err := grafanarest.SetDualWritingMode(ctx, kvStore, legacy, storage, key, mode, reg, serverLock, getRequestInfo(gr, namespaceMapper))
 			if err != nil {
 				return nil, err
 			}
@@ -180,6 +195,10 @@ func InstallAPIs(
 			case grafanarest.Mode4:
 				return storage, nil
 			default:
+			}
+
+			if storageOpts.DualWriterDataSyncJobEnabled[key] {
+				grafanarest.StartPeriodicDataSyncer(ctx, currentMode, legacy, storage, key, reg, serverLock, getRequestInfo(gr, namespaceMapper))
 			}
 			return grafanarest.NewDualWriter(currentMode, legacy, storage, reg, key), nil
 		}
